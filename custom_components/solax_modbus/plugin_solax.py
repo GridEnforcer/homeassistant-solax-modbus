@@ -686,6 +686,74 @@ def autorepeat_function_remotecontrol_recompute(initval: int, descr: Any, datadi
     return {"action": WRITE_MULTI_MODBUS, "data": res}
 
 
+# ============================ GEN2/GEN3 ModbusPowerControl ========================================================
+#
+# Regs 124-128 are the GEN2/GEN3 counterpart of the GEN4/GEN5 RemoteControl block.
+# The block is volatile RAM (no EE-Save marker in the protocol), so unlike the
+# work-mode and battery-current registers it can be re-asserted continuously
+# without EEPROM wear -- which is the whole point of using it for power control.
+#
+#   124      ModbusPowerControl    0 = off, 1 = enabled
+#   125/126  ActivePower           int32 W at the AC reference point,
+#                                  positive = charge, negative = discharge
+#   127/128  ReactivePower         int32 Var (unused here, always 0)
+#   159      PowerControl_timeout  inverter-side dead-man switch in seconds --
+#            (0x9F)                ALREADY EXPOSED as the `export_duration`
+#                                  select, whose options are this register's
+#                                  seconds (900 = "15 Minutes"). That entity is
+#                                  misleadingly named for Gen2/Gen3: it is the
+#                                  power-control timeout, not an export setting.
+#                                  Deliberately not duplicated here.
+#   166      ModbusPowerControl    readback / acknowledgement
+#   (0xA6)
+#
+# The inverter reverts to its own work mode if the block is not re-asserted
+# within the reg-159 timeout; `autorepeat` on the trigger button is what keeps
+# it alive. Writing the all-zero block releases control and the inverter resumes
+# native behaviour immediately.
+#
+# The register layout and the signed encoding are PORTED FROM A FIELD-PROVEN
+# DEPLOYMENT rather than derived from the spec: the reference implementation
+# writes `[1, 65536 + s, 65535, 0, 0]` for a negative target, i.e. int32 with the
+# LOW word first, which is exactly what this plugin's order32="little" produces.
+# Verified on GEN3 hardware 2026-08-20/23.
+#
+# NOTE for anyone extending this: ActivePower is the INVERTER'S AC power, not the
+# battery's. Setting it to 0 in daylight therefore throttles PV to ~0 while the
+# house keeps importing. Use the zero block (release) to idle, not ActivePower=0.
+
+
+def autorepeat_function_powercontrol_recompute(initval: int, descr: Any, datadict: dict[str, Any]) -> dict[str, Any]:
+    """Build the GEN2/GEN3 ModbusPowerControl block for regs 124-128."""
+    enabled = datadict.get("powercontrol_enable", "Disabled")
+    try:
+        target = int(datadict.get("powercontrol_active_power", 0) or 0)
+    except (TypeError, ValueError):
+        target = 0
+
+    # Release on an explicit Disable, and on the final call after the autorepeat
+    # duration lapses. The hub writes this POST payload, so the loop hands the
+    # battery back by itself rather than relying solely on the inverter watchdog.
+    release = initval == BUTTONREPEAT_POST or enabled == "Disabled"
+    if release:
+        if enabled == "Disabled":
+            autorepeat_stop(datadict, "powercontrol_trigger")
+        target = 0
+
+    res = [
+        (REGISTER_U16, 0 if release else 1),
+        (REGISTER_S32, target),
+        (REGISTER_S32, 0),
+    ]
+    _LOGGER.debug(
+        "Evaluated powercontrol_trigger: release=%s target=%sW block=%s",
+        release,
+        target,
+        res,
+    )
+    return {"action": WRITE_MULTI_MODBUS, "data": res}
+
+
 def autorepeat_bms_charge(datadict: dict[str, Any], battery_capacity: float, max_charge_soc: float, available: float) -> tuple[int, int, int, int]:
     # Determines max rate for charging battery
 
@@ -1633,6 +1701,17 @@ BUTTON_TYPES: Sequence["SolaxModbusButtonEntityDescription"] = [
         autorepeat="remotecontrol_autorepeat_duration",
     ),
     SolaxModbusButtonEntityDescription(
+        name="Powercontrol Trigger (Gen2/Gen3)",
+        key="powercontrol_trigger",
+        register=0x7C,  # 124 decimal - same address as the Gen4/Gen5 RemoteControl
+        #                 block above, but a different layout on Gen2/Gen3.
+        allowedtypes=AC | HYBRID | GEN2 | GEN3,
+        write_method=WRITE_MULTI_MODBUS,
+        icon="mdi:battery-clock",
+        value_function=autorepeat_function_powercontrol_recompute,
+        autorepeat="powercontrol_autorepeat_duration",
+    ),
+    SolaxModbusButtonEntityDescription(
         name="System On",
         key="system_on",
         register=0x1C,
@@ -1948,6 +2027,37 @@ NUMBER_TYPES: Sequence["SolaxModbusNumberEntityDescription"] = [
         register_data_type=REGISTER_S32,
         write_method=WRITE_DATA_LOCAL,
         fmt="i",
+        suggested_display_precision=0,
+    ),
+    SolaxModbusNumberEntityDescription(
+        name="Powercontrol Active Power (Gen2/Gen3)",
+        key="powercontrol_active_power",
+        allowedtypes=AC | HYBRID | GEN2 | GEN3,
+        native_min_value=-30000,
+        native_max_value=30000,
+        native_step=100,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=NumberDeviceClass.POWER,
+        initvalue=0,
+        min_exceptions_minus=MAX_EXPORT,  # negative
+        register_data_type=REGISTER_S32,
+        write_method=WRITE_DATA_LOCAL,
+        fmt="i",
+        suggested_display_precision=0,
+    ),
+    SolaxModbusNumberEntityDescription(
+        name="Powercontrol Autorepeat Duration (Gen2/Gen3)",
+        key="powercontrol_autorepeat_duration",
+        register_data_type=REGISTER_U16,
+        allowedtypes=AC | HYBRID | GEN2 | GEN3,
+        icon="mdi:home-clock",
+        initvalue=0,  # seconds; 0 = single shot
+        native_min_value=0,
+        native_max_value=172800,
+        native_step=1,
+        fmt="i",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        write_method=WRITE_DATA_LOCAL,
         suggested_display_precision=0,
     ),
     SolaxModbusNumberEntityDescription(
@@ -3411,6 +3521,19 @@ SELECT_TYPES: Sequence["SolaxModbusSelectEntityDescription"] = [
     #
     ###
     SolaxModbusSelectEntityDescription(
+        name="Powercontrol Enable (Gen2/Gen3)",
+        key="powercontrol_enable",
+        register_data_type=REGISTER_U16,
+        write_method=WRITE_DATA_LOCAL,
+        option_dict={
+            0: "Disabled",
+            1: "Enabled",
+        },
+        allowedtypes=AC | HYBRID | GEN2 | GEN3,
+        initvalue=0,  # Disabled
+        icon="mdi:transmission-tower",
+    ),
+    SolaxModbusSelectEntityDescription(
         name="Remotecontrol Power Control (mode 1)",
         key="remotecontrol_power_control",
         register_data_type=REGISTER_U16,
@@ -4445,6 +4568,16 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         scale=value_function_gen4time,
         allowedtypes=AC | HYBRID | GEN4 | GEN5 | GEN6,
         internal=True,
+    ),
+    SolaXModbusSensorEntityDescription(
+        name="Powercontrol Ack (Gen2/Gen3)",
+        key="powercontrol_ack",
+        register=0xA6,  # 166 decimal - ModbusPowerControl readback
+        register_data_type=REGISTER_U16,
+        allowedtypes=AC | HYBRID | GEN2 | GEN3,
+        entity_registry_enabled_default=False,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:check-network",
     ),
     SolaXModbusSensorEntityDescription(
         key="discharge_end_2",
